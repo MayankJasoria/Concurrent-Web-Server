@@ -147,7 +147,7 @@ int create_listening_socket(int port) {
  */
 void enqueue_record(int fd) {
 	mq_entry rec;
-	rec.mtype = 0;
+	rec.mtype = rand();
 	rec.fd = fd;
 	if(msgsnd(msg_id, &rec, sizeof(rec.fd), 0) == -1) {
 		report_error("Failed to send message");
@@ -177,6 +177,14 @@ void get_file_properties(char* filename, char* last_mod, int* file_size) {
 	stat(filename, &attrib);
 	strftime(last_mod, sizeof(last_mod), "%a, %d %b %Y %H:%M:%S %Z", gmtime(&attrib.st_mtime));
 	*file_size = attrib.st_size;
+}
+
+/*** debug ****/
+void printElement(void* data) {
+	hashElement* keyval = (hashElement*) data;
+	printf("KEY: %d, ", keyval->key);
+	State_IO* val = (State_IO*) keyval->data;
+	printf("State: %d, Read Ptr: %d, Write Ptr: %d, Data Size: %d, Buffer: %s, Data Buffer: %s", val->state, val->read_ptr, val->write_ptr, val->data_size, val->buffer, val->data_buffer);
 }
 
 /**
@@ -231,6 +239,9 @@ void* thread_logic(void* arg) {
 			}
 			break;
 			case HEADER_PARSING: {
+				/**** debug ****/
+				printf("\nREQUEST: \n%s\n", ht_entry->buffer);
+
 				char* line = strtok(ht_entry->buffer, "\r\n");
 				if(strstr(line, "GET") == NULL) {
 					// setup for HTTP 501 unsupported operation error
@@ -285,14 +296,10 @@ void* thread_logic(void* arg) {
 						tot_size += size;
 					} while(tot_size < DATA_BUF_SIZE && size > 0);
 				}
-				/**** debug ****/
-				printf("REQUEST: \n%s\n", ht_entry->buffer);
 
 				ht_entry->state = WRITING_HEADER;
 
-				if(msgsnd(msg_id, &rec, sizeof(int), 0) == -1) {
-					report_error("Failed to add update to the queue");
-				}
+				enqueue_record(rec.fd);
 			}
 			break;
 			case WRITING_HEADER: {
@@ -333,21 +340,23 @@ void* thread_logic(void* arg) {
 			case WRITING_BODY: {
 				// bringing file contents and header into single buffer
 				strcpy(ht_entry->buffer + ht_entry->write_ptr, ht_entry->data_buffer);
+				ht_entry->write_ptr += strlen(ht_entry->data_buffer);
 
 				ht_entry->state = DONE;
-				if(msgsnd(msg_id, &rec, sizeof(int), 0) == -1) {
-					report_error("Failed to add update to message queue");
-				}
+
+				enqueue_record(rec.fd);
 			}
 			break;
 			case DONE: {
 				/**** debug ****/
-				printf("RESPONSE: \n%s\n", ht_entry->buffer);
+				printf("\nRESPONSE: \n%s\n", ht_entry->buffer);
 
 				// send the data to the client
 				ht_entry->read_ptr = 0;
-				while(ht_entry->read_ptr < ht_entry->write_ptr) {
+				printf("\nRead Ptr: %d, Write Ptr: %d\n", ht_entry->read_ptr, ht_entry->write_ptr); /*** debug ***/
+				while((ht_entry->read_ptr) < (ht_entry->write_ptr)) {
 					int size = send(rec.fd, ht_entry->buffer + ht_entry->read_ptr, ht_entry->write_ptr - ht_entry->read_ptr, 0);
+					printf("Size of data sent: %d\n", size);
 					if(size == -1 && errno != EWOULDBLOCK && errno != EAGAIN) {
 						if(errno == ECONNRESET) {
 							// client closed the connection
@@ -383,7 +392,11 @@ int main(int argc, char** argv) {
 		fprintf(stderr, "Expected 1 argument, found none\nUsage: %s <port_number>\n", argv[0]);
 		return EXIT_FAILURE;
 	}
+	// signal handler to perform cleanup on closing server with Ctrl+C
 	signal(SIGINT, sigint_handler);
+
+	// setting seed for rand()
+	srand(time(0));
 
 	int port = atoi(argv[1]);
 

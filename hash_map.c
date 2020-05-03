@@ -7,11 +7,7 @@ boolean initialized = False;
 
 HashTable getHashTable() {
 	/* Creating a Hash Table */
-	HashTable table = (HashTable) malloc(sizeof(List) * HASH_TABLE_SIZE);
-	for(int i = 0; i < HASH_TABLE_SIZE; i++) {
-		/* Initializing all hash cells to NULL */
-		table[i] = NULL;
-	}
+	HashTable table = (HashTable) calloc(HASH_TABLE_SIZE, sizeof(List));
 	return table;
 }
 
@@ -70,10 +66,10 @@ void* getDataFromTable(HashTable table, int* key, int (*hash)(void *)) {
 	}
 	
 	/* Find the node containing the {key, data} */
-	Node* hashNode = checkKeyInList(table, key, idx);
+	hashElement* hashNode = checkKeyInList(table, key, idx);
 
 	if(hashNode != NULL) {
-		return ((hashElement *)hashNode->data)->data;
+		return (hashNode->data);
 	}
 
 	/* key not found */
@@ -86,13 +82,13 @@ HashTable removeFromTable(HashTable table, int* key, int (*hash)(void *)) {
 		return table;
 	}
 	int idx = hash(key);
-	// int idx = computeHash((char*) key);
 	if(table[idx] != NULL) {
 		/* Some key(s) present in this index, search for required key */
-		Node* remNode = checkKeyInList(table, key, idx);
+		hashElement* remNode = checkKeyInList(table, key, idx);
 		if(remNode != NULL) {
 			/* key found, delete it*/
 			table[idx] = deleteByData(table[idx], key, int_key_comparator);
+			free(remNode);
 		}
 	}
 
@@ -116,7 +112,7 @@ int stringHash(void *y) {
  * Credits: Answer by Thomal Mueller on https://stackoverflow.com/questions/664014/what-integer-hash-function-are-good-that-accepts-an-integer-hash-key
  */
 int numberHash(void *y) {
-	long long int x = *((long long int *)y);
+	int x = *((int *)y);
 	x = ((x >> 16) ^ x) * 0x45d9f3b;
     x = ((x >> 16) ^ x) * 0x45d9f3b;
     x = (x >> 16) ^ x;
@@ -129,10 +125,10 @@ int numberHash(void *y) {
  */  
 void printHashTable(HashTable hashtable, void (*printHash)(void* data)) {
 	for (int i=0; i < HASH_TABLE_SIZE; i++) {
-		if(hashtable[i] != NULL) {
-		// 	printf("[NULL]\n");
-		// } else {
-			// printf("[%d] --> ", i);
+		if(hashtable[i] == NULL) {
+			printf("[NULL]\n");
+		} else {
+			printf("[%d] --> ", i);
 			printList(hashtable[i], printHash);
 		}
 	}

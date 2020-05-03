@@ -81,9 +81,9 @@ List deleteByData(List list, void* data, int (*comp)(void*, void*)) {
 		return list;
 	}
 
-	Node* curr = list->head->next;
+	Node* curr = list->head;
 	while(curr != NULL) {
-		if(comp(data, curr->data) == 1) {
+		if(comp(data, curr->data)) {
 			/* Element to be deleted found */
 			if(curr->prev != NULL) {
 				curr->prev->next = curr->next;
