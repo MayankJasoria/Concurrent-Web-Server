@@ -15,10 +15,10 @@
 #include "hash_map.h"
 
 #define BACKLOG_LIMIT 5
-#define DATA_BUF_SIZE 2049
-#define MAX_EVENTS 10
+#define DATA_BUF_SIZE 7681
+#define MAX_EVENTS 20
 #define NUM_THREADS 10
-#define HTTP_RESPONSE_TEMPLATE "HTTP/1.1 %d %s\r\nDate: %s\r\nServer: Apache/1.2.6 Red Hat\r\nLast-Modified: %s\r\nContent-Length: %d\r\nAccept-Ranges: bytes\r\nKeep-Alive: timeout=15, max=100\r\nConnection: Keep-Alive\r\nContent-Type: text/html\r\n\r\n"
+#define HTTP_RESPONSE_TEMPLATE "HTTP/1.0 %d %s\r\nDate: %s\r\nServer: Apache/1.2.6 Red Hat\r\nLast-Modified: %s\r\nContent-Length: %d\r\nAccept-Ranges: bytes\r\nKeep-Alive: timeout=15, max=100\r\nConnection: Keep-Alive\r\nContent-Type: %s\r\n\r\n"
 
 /* defines the different states of a request */
 typedef enum {
@@ -35,9 +35,13 @@ typedef struct state_io {
 	State state;
 	char buffer[BUFSIZ];
 	char data_buffer[DATA_BUF_SIZE];
+	char filename[1024];
 	int data_size;
 	int read_ptr;
 	int write_ptr;
+	int data_sent;
+	int file_fd;
+	int file_size;
 } State_IO;
 
 /* entry to be passed for inter-thread communication via message queue */
@@ -66,6 +70,36 @@ void sigint_handler(int signo) {
 	}
 	msg_id = -1;
 	exit(EXIT_FAILURE);
+}
+
+/**
+ * Returns the content type according to the requested filename
+ * @param filename		The name of the requested file
+ * @param content_type	Buffer for storing the content type
+ */
+void get_content_type(char* filename, char* content_type) {
+	char* extension = strtok(filename, ".");
+	extension = strtok(NULL, ",");
+
+	if(strcmp(extension, "html") == 0 || strcmp(extension, "htm") == 0) {
+		strcpy(content_type, "text/html");
+	} else if(strcmp(extension, "jpeg") == 0 || strcmp(extension, "jpg") == 0) {
+		strcpy(content_type, "image/jpg");
+	} else if(strcmp(extension, "css") == 0) {
+		strcpy(content_type, "text/css");
+	} else if(strcmp(extension, "js") == 0) {
+		strcpy(content_type, "application/javascript");
+	} else if(strcmp(extension, "json") == 0) {
+		strcpy(content_type, "application/json");
+	} else if(strcmp(extension, "txt") == 0) {
+		strcpy(content_type, "text/plain");
+	} else if(strcmp(extension, "gif") == 0) {
+		strcpy(content_type, "image/gif");
+	} else if(strcmp(extension, "png") == 0) {
+		strcpy(content_type, "image/png");
+	} else {
+		strcpy(content_type, "application/octet-stream");
+	}
 }
 
 /**
@@ -214,12 +248,41 @@ void* thread_logic(void* arg) {
 		// fetch state from hash table
 		State_IO* ht_entry = (State_IO*) getDataFromTable(table, &(rec.fd), numberHash);
 
+		if(ht_entry == NULL) {
+			// Message existed but connection was closed
+			continue;
+		}
+
 		switch(ht_entry->state) {
 			case READING_REQUEST: {
+				// keep reading the request from client till al complete header is received
 				while((ht_entry->data_size < 4) || test_http_header_end(ht_entry->buffer, ht_entry->read_ptr) == 0) {
 					int size = recv(rec.fd, ht_entry->buffer + ht_entry->read_ptr, BUFSIZ - ht_entry->data_size - 1, 0);
-					if(size == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
-						report_error("Failed to perform read");
+					if(size == -1) {
+						if(errno != EAGAIN && errno != EWOULDBLOCK) {
+							ht_entry->state = READING_REQUEST;
+							// data nut available at present, enqueue it for future
+							enqueue_record(rec.fd);
+
+							break;
+						} else if(errno == EBADF) {
+							// connection must have been closed earlier
+							table = removeFromTable(table, &(rec.fd), numberHash);
+							// close file descriptor
+							if(ht_entry->file_fd != -1) {
+								close(ht_entry->file_fd);
+							}
+
+							// release memory consumed for hash table record
+							free(ht_entry);
+							ht_entry = NULL;
+
+							// close connection
+							close(rec.fd);
+							break;
+						} else {
+							report_error("Failed to perform read");
+						}
 					} else if(size == 0) {
 						// client sent EOF, or closed connection
 						table = removeFromTable(table, &(rec.fd), numberHash);
@@ -231,16 +294,20 @@ void* thread_logic(void* arg) {
 						ht_entry->read_ptr += size;
 					}
 				}
+
+				if(ht_entry == NULL) {
+					break;
+				}
 				
 				// update state (change will automatically be reflected in hash table)
 				ht_entry->state = HEADER_PARSING;
 
+				// add message to queue
 				enqueue_record(rec.fd);
 			}
 			break;
 			case HEADER_PARSING: {
-				/**** debug ****/
-				printf("\nREQUEST: \n%s\n", ht_entry->buffer);
+				printf("\nREQUEST RECEIVED: \n%s\n", ht_entry->buffer);
 
 				char* line = strtok(ht_entry->buffer, "\r\n");
 				if(strstr(line, "GET") == NULL) {
@@ -253,27 +320,28 @@ void* thread_logic(void* arg) {
 
 				// HTTP GET requet received, identify requested file
 				char* file = strtok((ht_entry->buffer + 5), " \r\n");
-
-				// overwriting since other contents not relevant (for our simplistic case)
-				strcpy(ht_entry->buffer, file); 
+				strcpy(ht_entry->filename, file);
+ 
 				ht_entry->state = READING_DISKFILE;
 				enqueue_record(rec.fd);
 			}
 			break;
 			case READING_DISKFILE: { // assumption: file fits into buffer
 				if(ht_entry->data_size == -1) {
+					// printf("Unsupported Operation\n");
 					// HTTP 501: Unsupported Operation
 					char operation[16];
 					strcpy(operation, strtok(ht_entry->buffer, " /\r\n"));
-					int filefd = open("unsupported.html", O_RDONLY | O_NONBLOCK);
+					strcpy(ht_entry->filename, "unsupported.html");
+					int filefd = open(ht_entry->filename, O_RDONLY | O_NONBLOCK);
 					int tot_size = 0, size = 0;
 					do {
-						size = read(filefd, ht_entry->data_buffer + tot_size, DATA_BUF_SIZE);
+						size = read(filefd, ht_entry->data_buffer + tot_size, DATA_BUF_SIZE - 1);
 						if(size == -1) {
 							report_error("Failed to read from disk");
 						}
 						tot_size += size;
-					} while(tot_size < DATA_BUF_SIZE && size > 0);
+					} while(tot_size < DATA_BUF_SIZE - 1 && size > 0);
 
 					// receives format from file, formats it using the request stored in buffer, copies it into data buffer
 					sprintf(ht_entry->data_buffer, ht_entry->data_buffer, ht_entry->buffer);
@@ -281,23 +349,51 @@ void* thread_logic(void* arg) {
 					// file input taken. Close file descriptor
 					close(filefd);
 				} else {
-					int filefd = open(ht_entry->buffer, O_RDONLY | O_NONBLOCK);
-					if(filefd == -1) {
-						// some error occurred: report it as file not found
-						filefd = open("not_found_error.html", O_RDONLY | O_NONBLOCK);
-						ht_entry->data_size = -2;
+					if(ht_entry->file_fd == -1) {
+						ht_entry->file_fd = open(ht_entry->filename, O_RDONLY | O_NONBLOCK);
 					}
+					if(ht_entry->file_fd == -1) {
+						// printf("File Not found\n");
+						// some error occurred: report it as file not found
+						strcpy(ht_entry->filename, "not_found_error.html");
+						ht_entry->file_fd = open(ht_entry->filename, O_RDONLY | O_NONBLOCK);
+						ht_entry->data_size = -2;
+					} 
+
+					ht_entry->read_ptr = 0;
+					// else {
+					// 	printf("Opening requesed file\n");
+					// 	// seek to the last offset till where file has been read
+					// 	int off = lseek(filefd, ht_entry->data_sent, SEEK_CUR);
+					// 	if(off != ht_entry->data_sent) {
+					// 		report_error("Failed to seek to correct position in file");
+					// 	} else {
+					// 		printf("lseek performed till offset %d\n", off);
+					// 	}
+					// }
 					int tot_size = 0, size = 0;
+					// read till buffer is full or file is totally read into the buffer
 					do {
-						size = read(filefd, ht_entry->data_buffer + tot_size, DATA_BUF_SIZE);
+						size = read(ht_entry->file_fd, ht_entry->data_buffer + tot_size, DATA_BUF_SIZE - 1);
 						if(size == -1) {
 							report_error("Failed to read from disk");
 						}
 						tot_size += size;
-					} while(tot_size < DATA_BUF_SIZE && size > 0);
+						ht_entry->read_ptr += size;
+					} while(tot_size < DATA_BUF_SIZE - 1 && size > 0);
+					// close(filefd);
+
+					// printf("Data read From File: %s\n", ht_entry->data_buffer);
 				}
 
-				ht_entry->state = WRITING_HEADER;
+				if(ht_entry->write_ptr == 0) {
+					ht_entry->state = WRITING_HEADER;
+				} else {
+					ht_entry->state = WRITING_BODY;
+					ht_entry->write_ptr = 0;
+				}
+
+				// printf("%s", ht_entry->data_buffer);
 
 				enqueue_record(rec.fd);
 			}
@@ -314,33 +410,55 @@ void* thread_logic(void* arg) {
 				char status_msg[20];
 				int content_length = 0;
 				char last_mod_time[35];
+				char mime_type[35];
 				if(ht_entry->data_size == -1) {
 					// HTTP 501: Unsupported Operation
-					get_file_properties("unsupported.html", last_mod_time, &content_length);
+					get_file_properties(ht_entry->filename, last_mod_time, &content_length);
 					status_code = 501;
 					strcpy(status_msg, "Not Implemented");
+					char filename[100];
+					strcpy(filename, ht_entry->filename);
+					get_content_type(filename, mime_type);
 				} else if(ht_entry->data_size == -2) {
 					// HTTP 404
-					get_file_properties("not_found_error.html", last_mod_time, &content_length);
+					get_file_properties(ht_entry->filename, last_mod_time, &content_length);
 					status_code = 404;
 					strcpy(status_msg, "Not Found");
+					char filename[100];
+					strcpy(filename, ht_entry->filename);
+					get_content_type(filename, mime_type);
 				} else {
-					get_file_properties(ht_entry->buffer, last_mod_time, &content_length);
+					// Found requested file
+					get_file_properties(ht_entry->filename, last_mod_time, &content_length);
 					status_code = 200;
 					strcpy(status_msg, "OK");
+					char filename[100];
+					strcpy(filename, ht_entry->filename);
+					get_content_type(filename, mime_type);
 				}
 
-				sprintf(ht_entry->buffer, HTTP_RESPONSE_TEMPLATE, status_code, status_msg, sys_time, last_mod_time, content_length);
+				ht_entry->file_size = content_length;
+
+				sprintf(ht_entry->buffer, HTTP_RESPONSE_TEMPLATE, status_code, status_msg, sys_time, last_mod_time, content_length, mime_type);
 				ht_entry->write_ptr = strlen(ht_entry->buffer);
 				ht_entry->state = WRITING_BODY;
+
+				// printf("Header:\n%s\n", ht_entry->buffer);
 
 				enqueue_record(rec.fd);
 			}
 			break;
 			case WRITING_BODY: {
 				// bringing file contents and header into single buffer
-				strcpy(ht_entry->buffer + ht_entry->write_ptr, ht_entry->data_buffer);
-				ht_entry->write_ptr += strlen(ht_entry->data_buffer);
+				// strcpy(ht_entry->buffer + ht_entry->write_ptr, ht_entry->data_buffer);
+				// ht_entry->write_ptr += strlen(ht_entry->data_buffer);
+
+				int i;
+				for(i = 0; i <= ht_entry->read_ptr; i++) {
+					ht_entry->buffer[ht_entry->write_ptr + i] = ht_entry->data_buffer[i];
+				}
+
+				ht_entry->write_ptr += ht_entry->read_ptr;
 
 				ht_entry->state = DONE;
 
@@ -348,21 +466,34 @@ void* thread_logic(void* arg) {
 			}
 			break;
 			case DONE: {
-				/**** debug ****/
-				printf("\nRESPONSE: \n%s\n", ht_entry->buffer);
-
 				// send the data to the client
 				ht_entry->read_ptr = 0;
-				printf("\nRead Ptr: %d, Write Ptr: %d\n", ht_entry->read_ptr, ht_entry->write_ptr); /*** debug ***/
 				while((ht_entry->read_ptr) < (ht_entry->write_ptr)) {
+					printf("\nRead Ptr: %d, Write Ptr: %d\n", ht_entry->read_ptr, ht_entry->write_ptr); /*** debug ***/
 					int size = send(rec.fd, ht_entry->buffer + ht_entry->read_ptr, ht_entry->write_ptr - ht_entry->read_ptr, 0);
 					printf("Size of data sent: %d\n", size);
-					if(size == -1 && errno != EWOULDBLOCK && errno != EAGAIN) {
-						if(errno == ECONNRESET) {
-							// client closed the connection
+					if(size == -1) {
+						if(errno != EWOULDBLOCK && errno != EAGAIN) {
+							// data nut available at present, enqueue it for future
+							ht_entry->state = DONE;
+							enqueue_record(rec.fd);
+
+							break;
+						} else if(errno == ECONNRESET || errno == EBADF) {
+							// client closed the connection (now or earlier)
 							table = removeFromTable(table, &(rec.fd), numberHash);
+							// close file descriptor
+							if(ht_entry->file_fd != -1) {
+								close(ht_entry->file_fd);
+							}
+
+							// release memory consumed for hash table record
 							free(ht_entry);
+							ht_entry = NULL;
+
+							// close connection
 							close(rec.fd);
+							break;
 						} else {
 							report_error("Failed to send data to client");
 						}
@@ -371,11 +502,31 @@ void* thread_logic(void* arg) {
 					}
 				}
 
-				// remove the entry from the hash table
-				table = removeFromTable(table, &(rec.fd), numberHash);
-				
-				// free the memory block allocated for this operation
-				free(ht_entry);
+				if(ht_entry == NULL) {
+					break;
+				}
+
+				ht_entry->data_sent += ht_entry->read_ptr;
+				printf("DONE: Data Sent %d\n", ht_entry->data_sent);
+
+				if(ht_entry->data_sent < ht_entry->file_size) {
+					ht_entry->state = READING_DISKFILE;
+					ht_entry->read_ptr = 0;
+					memset(ht_entry->data_buffer, '\0', DATA_BUF_SIZE);
+					printf("DONE --> READING_DISKFILE\n");
+					enqueue_record(rec.fd);
+				} else {
+					printf("Cleanup\n");
+
+					// close file descriptor
+					close(ht_entry->file_fd);
+
+					// remove the entry from the hash table
+					table = removeFromTable(table, &(rec.fd), numberHash);
+					
+					// free the memory block allocated for this operation
+					free(ht_entry);
+				}
 			}
 			break;
 			default: {
@@ -402,6 +553,8 @@ int main(int argc, char** argv) {
 
 	// creating a listening socket
 	int listenfd = create_listening_socket(port);
+
+	printf("Waiting for connections on port %d\n", port);
 
 	// create the hash table
 	table = getHashTable();
@@ -460,7 +613,7 @@ int main(int argc, char** argv) {
 		int i;
 		for(i = 0; i < nfds; ++i) {
 			if(events[i].data.fd == listenfd) {
-				printf("Accepted connection\n");
+				// printf("Accepted connection\n");
 				// new connection incoming, accept connection
 				int connfd = accept(listenfd, NULL, NULL);
 				if(connfd == -1) {
@@ -480,19 +633,23 @@ int main(int argc, char** argv) {
 				}
 			} else {
 				if((events[i].events & EPOLLRDHUP) != 0) {
-					printf("Closed connection: %d\n", events[i].data.fd);
+					// printf("Closed connection: %d\n", events[i].data.fd);
 					// connection closed by client: close to deregister from epoll()
 					close(events[i].data.fd);
 				} else {
-					printf("Incoming request: %d\n", events[i].data.fd);
+					// printf("Incoming request: %d\n", events[i].data.fd);
 					// incoming request: add fd to message queue, and state to hash table
 					State_IO* ht_rec = (State_IO*) malloc(sizeof(State_IO));
 					ht_rec->state = READING_REQUEST;
 					memset(ht_rec->buffer, '\0', BUFSIZ);
 					memset(ht_rec->data_buffer, '\0', DATA_BUF_SIZE);
+					memset(ht_rec->filename, '\0', 1024);
 					ht_rec->read_ptr = 0;
 					ht_rec->write_ptr = 0;
 					ht_rec->data_size = 0;
+					ht_rec->data_sent = 0;
+					ht_rec->file_fd = -1;
+					ht_rec->file_size = 0;
 					int fd = events[i].data.fd;
 					table = insertToTable(table, &fd, ht_rec, numberHash);
 					enqueue_record(fd);
